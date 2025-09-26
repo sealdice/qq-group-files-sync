@@ -31,4 +31,7 @@ go.work.sum
 # .idea/
 # .vscode/
 
-./data
+config.yaml
+data/
+logs/
+test_data/

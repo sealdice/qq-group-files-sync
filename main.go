@@ -1,13 +1,14 @@
 package main
 
 // 一个用于调试 OneBot11 适配器的简单入口
-
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -28,7 +29,11 @@ func (cb *ob11Callback) OnError(err error) {
 	debug.PrintStack()
 }
 
-var conn *adapters.PlatformAdapterOB11
+var (
+	conn      *adapters.PlatformAdapterOB11
+	config    *AppConfig
+	fsManager *FileSystemManager
+)
 
 func (cb *ob11Callback) OnMessageReceived(info *adapters.MessageSendCallbackInfo) {
 	jsonInfo, err := json.Marshal(info)
@@ -48,16 +53,16 @@ func (cb *ob11Callback) OnMessageReceived(info *adapters.MessageSendCallbackInfo
 		fmt.Println("群名片设置", err, ok, GroupCardNameSetRequest)
 	}
 
-	if strings.Contains(info.Message.Segments.ToText(), "群信息") {
-		GroupInfoGetResponse, err := conn.GroupInfoGet(info.Message.GroupID)
+	if strings.EqualFold(info.Message.Segments.ToText(), "群信息") {
+		_, err := conn.GroupInfoGet(info.Message.GroupID)
 		if err != nil {
-			fmt.Printf("OnMessageReceived: GroupInfoGet err, GroupID=%d, err=%v\n", info.Message.GroupID, err)
+			fmt.Printf("OnMessageReceived: GroupInfoGet err, GroupID=%s, err=%v\n", info.Message.GroupID, err)
 			return
 		}
-		fmt.Println("???!", GroupInfoGetResponse)
+		// fmt.Println("???!", GroupInfoGetResponse)
 	}
 
-	if strings.Contains(info.Message.Segments.ToText(), "群文件") {
+	if strings.EqualFold(info.Message.Segments.ToText(), "群文件") {
 		// 判断发送者不是自己，是自己就退出
 		// 坏了 好像不知道自己是谁
 		// 似乎如果 sender 是空的 就是自己
@@ -89,17 +94,15 @@ func (cb *ob11Callback) OnMessageReceived(info *adapters.MessageSendCallbackInfo
 		})
 	}
 
-	if strings.Contains(info.Message.Segments.ToText(), "同步文件") {
+	if strings.EqualFold(info.Message.Segments.ToText(), "同步文件") {
 		// 判断发送者不是自己，是自己就退出
 		// 如果 sender 是空的 就是自己
 		if info.Message.Sender.UserID == "" {
 			return
 		}
 
-		// 创建群文件助手，设置下载路径为 data/群号
-		// 清理群号中的不安全字符，避免Windows文件名问题
-		downloadPath := "./data"
-		helper := NewGroupFileHelper(conn, downloadPath)
+		// 创建群文件助手，使用配置的文件系统管理器
+		helper := NewGroupFileHelper(conn, fsManager)
 
 		conn.MsgSendToGroup(&adapters.MessageSendRequest{
 			TargetId: info.Message.GroupID,
@@ -120,16 +123,56 @@ func (cb *ob11Callback) OnMessageReceived(info *adapters.MessageSendCallbackInfo
 			})
 			return
 		}
+		if err := GenerateDashboard(config, fsManager); err != nil {
+			zap.S().Warnf("failed to build dashboard: %v", err)
+		}
 
-		fmt.Printf("群文件同步完成，保存到: %s\n", downloadPath)
+		basePath := fsManager.GetBasePath()
+		fmt.Printf("群文件同步完成，保存到: %s\n", basePath)
 		conn.MsgSendToGroup(&adapters.MessageSendRequest{
 			TargetId: info.Message.GroupID,
 			Segments: []types.IMessageElement{
-				&types.TextElement{Content: fmt.Sprintf("群文件同步完成，已保存到: %s", downloadPath)},
+				&types.TextElement{Content: fmt.Sprintf("群文件同步完成，已保存到: %s", basePath)},
 			},
 		})
 	}
 
+	if strings.EqualFold(info.Message.Segments.ToText(), "展示页面") {
+		if info.Message.Sender.UserID == "" {
+			return
+		}
+
+		// 生成HTML展示页面
+		err := GenerateDashboard(config, fsManager)
+		if err != nil {
+			fmt.Printf("生成展示页面失败: %v\n", err)
+			conn.MsgSendToGroup(&adapters.MessageSendRequest{
+				TargetId: info.Message.GroupID,
+				Segments: []types.IMessageElement{
+					&types.TextElement{Content: fmt.Sprintf("生成展示页面失败: %v", err)},
+				},
+			})
+			return
+		}
+
+		// 获取生成的HTML文件路径
+		outputFile := config.Web.DashboardFile
+		if outputFile == "" {
+			outputFile = "index.html"
+		}
+
+		// 获取文件系统基础路径
+		basePath := fsManager.GetBasePath()
+		fullPath := filepath.Join(basePath, outputFile)
+
+		fmt.Printf("展示页面生成完成: %s\n", fullPath)
+		conn.MsgSendToGroup(&adapters.MessageSendRequest{
+			TargetId: info.Message.GroupID,
+			Segments: []types.IMessageElement{
+				&types.TextElement{Content: fmt.Sprintf("展示页面生成完成，已保存到: %s", fullPath)},
+			},
+		})
+	}
 	// if cb.dice != nil && info.Message != nil {
 	// 	cb.dice.Execute("", info.Message)
 	// }
@@ -149,8 +192,27 @@ func (cb *ob11Callback) OnEvent(evt *adapters.AdapterEvent) {
 }
 
 func newOB11ConnItem() *adapters.PlatformAdapterOB11 {
-	reverse := os.Getenv("OB11_WS_REVERSE")
-	forward := os.Getenv("OB11_WS_FORWARD")
+	// 优先使用配置文件中的设置，如果配置文件中没有设置则使用环境变量
+	reverse := config.OneBot11Config.WSReverseURL
+	forward := config.OneBot11Config.WSForwardAddr
+	accessToken := config.OneBot11Config.AccessToken
+	secret := config.OneBot11Config.Secret
+
+	// 如果配置文件中没有设置，则使用环境变量
+	if reverse == "" {
+		reverse = os.Getenv("OB11_WS_REVERSE")
+	}
+	if forward == "" {
+		forward = os.Getenv("OB11_WS_FORWARD")
+	}
+	if accessToken == "" {
+		accessToken = os.Getenv("OB11_ACCESS_TOKEN")
+	}
+	if secret == "" {
+		secret = os.Getenv("OB11_SECRET")
+	}
+
+	// 如果都没有设置，使用默认值
 	if reverse == "" && forward == "" {
 		reverse = "ws://127.0.0.1:8100/onebot/v11/ws"
 	}
@@ -158,17 +220,43 @@ func newOB11ConnItem() *adapters.PlatformAdapterOB11 {
 	return &adapters.PlatformAdapterOB11{
 		WSReverseURL:  reverse,
 		WSForwardAddr: forward,
-		AccessToken:   os.Getenv("OB11_ACCESS_TOKEN"),
-		Secret:        os.Getenv("OB11_SECRET"),
+		AccessToken:   accessToken,
+		Secret:        secret,
 	}
 }
 
 func main() {
 	fmt.Println("Small Seal (OB11) v0.0.1")
-	logger, _ := zap.NewDevelopment()
+
+	// 读取配置文件
+	config = ReadConfig()
+
+	// 初始化日志
+	var logger *zap.Logger
+	var err error
+	if config.LogFile != "" {
+		logConfig := zap.NewProductionConfig()
+		logConfig.OutputPaths = []string{config.LogFile}
+		logger, err = logConfig.Build()
+		if err != nil {
+			log.Fatalf("初始化日志失败: %v", err)
+		}
+	} else {
+		logger, _ = zap.NewDevelopment()
+	}
 	defer logger.Sync()
 	zap.ReplaceGlobals(logger)
 
+	// 初始化文件系统管理器
+	fsManager, err = NewFileSystemManager(config.FileSystemConfig)
+	if err != nil {
+		log.Fatalf("初始化文件系统管理器失败: %v", err)
+	}
+	if err := GenerateDashboard(config, fsManager); err != nil {
+		zap.S().Warnf("failed to build dashboard: %v", err)
+	}
+
+	fmt.Println("???")
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 

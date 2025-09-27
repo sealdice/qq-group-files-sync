@@ -116,14 +116,14 @@ func (fsm *FileSystemManager) normalizePath(p string) string {
 		cleaned = strings.TrimPrefix(cleaned, "./")
 	}
 	cleaned = strings.TrimPrefix(cleaned, "/")
-	
+
 	// 如果设置了 S3 基础路径，则添加前缀
 	if fsm.s3BasePath != "" && cleaned != "" {
 		cleaned = fsm.s3BasePath + "/" + cleaned
 	} else if fsm.s3BasePath != "" {
 		cleaned = fsm.s3BasePath
 	}
-	
+
 	return cleaned
 }
 
@@ -238,12 +238,12 @@ func (fsm *FileSystemManager) ListStatusFiles() ([]string, error) {
 	if fsm.kind == "s3" {
 		return fsm.listS3StatusFiles()
 	}
-	return fsm.listLocalStatusFiles()
+	return fsm.listLocalStatusFiles(".")
 }
 
-func (fsm *FileSystemManager) listLocalStatusFiles() ([]string, error) {
+func (fsm *FileSystemManager) listLocalStatusFiles(pathExtra string) ([]string, error) {
 	files := make([]string, 0)
-	err := afero.Walk(fsm.fs, ".", func(path string, info os.FileInfo, walkErr error) error {
+	err := afero.Walk(fsm.fs, pathExtra, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -251,6 +251,7 @@ func (fsm *FileSystemManager) listLocalStatusFiles() ([]string, error) {
 			return nil
 		}
 		name := info.Name()
+		// 不知道这个过滤干啥的，感觉没必要的样子
 		if !strings.HasPrefix(name, "QQ-Group_") || !strings.HasSuffix(strings.ToLower(name), ".json") {
 			return nil
 		}
@@ -271,13 +272,13 @@ func (fsm *FileSystemManager) listS3StatusFiles() ([]string, error) {
 	if fsm.s3Session == nil || fsm.s3Config == nil || fsm.s3ListObjects == nil {
 		return nil, fmt.Errorf("S3文件系统尚未初始化")
 	}
-	
+
 	// 构建搜索前缀，考虑基础路径
 	searchPrefix := "QQ-Group_"
 	if fsm.s3BasePath != "" {
 		searchPrefix = fsm.s3BasePath + "/" + searchPrefix
 	}
-	
+
 	keys, err := fsm.s3ListObjects(fsm.s3Session, fsm.s3Config.Bucket, searchPrefix)
 	if err != nil {
 		return nil, err
@@ -293,7 +294,7 @@ func (fsm *FileSystemManager) listS3StatusFiles() ([]string, error) {
 				continue // 跳过不在基础路径下的文件
 			}
 		}
-		
+
 		if !strings.HasPrefix(relativeKey, "QQ-Group_") {
 			continue
 		}
@@ -304,6 +305,49 @@ func (fsm *FileSystemManager) listS3StatusFiles() ([]string, error) {
 		suffix := strings.TrimPrefix(relativeKey, "QQ-Group_")
 		if strings.Contains(suffix, "/") {
 			continue
+		}
+		files = append(files, relativeKey)
+	}
+	return files, nil
+}
+
+// 直接列出整个路径的文件列表
+func (fsm *FileSystemManager) ListStatusFilesX(pathExtra string) ([]string, error) {
+	if fsm.kind == "s3" {
+		return fsm.listS3StatusFilesX(pathExtra)
+	}
+	return fsm.listLocalStatusFiles(pathExtra)
+}
+
+func (fsm *FileSystemManager) listS3StatusFilesX(pathExtra string) ([]string, error) {
+	if fsm.s3Session == nil || fsm.s3Config == nil || fsm.s3ListObjects == nil {
+		return nil, fmt.Errorf("S3文件系统尚未初始化")
+	}
+
+	// 构建搜索前缀，考虑基础路径
+	searchPrefix := pathExtra
+	if fsm.s3BasePath != "" {
+		searchPrefix = fsm.s3BasePath + "/" + pathExtra
+	}
+	// 如果不以 / 结尾，加上
+	if !strings.HasSuffix(searchPrefix, "/") {
+		searchPrefix += "/"
+	}
+
+	keys, err := fsm.s3ListObjects(fsm.s3Session, fsm.s3Config.Bucket, searchPrefix)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]string, 0, len(keys))
+	for _, key := range keys {
+		// 移除基础路径前缀以获得相对路径
+		relativeKey := key
+		if fsm.s3BasePath != "" {
+			if strings.HasPrefix(key, fsm.s3BasePath+"/") {
+				relativeKey = strings.TrimPrefix(key, fsm.s3BasePath+"/")
+			} else {
+				continue // 跳过不在基础路径下的文件
+			}
 		}
 		files = append(files, relativeKey)
 	}

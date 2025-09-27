@@ -162,21 +162,15 @@ func (h *GroupFileHelper) isFolderInList(folderID string, folders []adapters.Gro
 	return false
 }
 
-// formatUploaderID 格式化上传者ID为标准用户ID格式
-func (h *GroupFileHelper) formatUploaderID(uploaderQQ int64) int64 {
-	// 保持原始QQ号，标准格式化在需要时通过FormatStandardUserID函数处理
-	return uploaderQQ
-}
-
 // DownloadAllFiles 依次下载所有附件，目录1:1
-
-func (h *GroupFileHelper) DownloadAllFiles(status *GroupFileStatus) error {
+func (h *GroupFileHelper) DownloadAllFilesWithPrediction(prediction *SyncPrediction) error {
+	status := prediction.GroupFileStatus
 	h.log.Infof("开始下载群 %s 的所有文件到目录: %s", status.GroupID, h.fsManager.GetBasePath())
 
-	// 预加载时间戳缓存
-	if err := h.preloadTimestampCache(status.GroupID); err != nil {
-		h.log.Warnf("预加载时间戳缓存失败: %v", err)
-	}
+	// 预加载时间戳缓存，传 prediction 的话应该已经加载过了
+	// if err := h.preloadTimestampCache(status.GroupID); err != nil {
+	// 	h.log.Warnf("预加载时间戳缓存失败: %v", err)
+	// }
 
 	totalFiles := len(status.Files)
 	totalFolders := len(status.Folders)
@@ -184,8 +178,12 @@ func (h *GroupFileHelper) DownloadAllFiles(status *GroupFileStatus) error {
 	for _, file := range status.Files {
 		totalSize += file.FileSize
 	}
+	h.log.Infof("总计: %d 个文件，%d 个文件夹，总大小: %s", totalFiles, totalFolders, h.formatFileSize(totalSize))
+	fmt.Printf("总计: %d 个文件，%d 个文件夹，总大小: %s\n", totalFiles, totalFolders, h.formatFileSize(totalSize))
 
-	h.log.Infof("预计下载: %d 个文件，%d 个文件夹，总大小: %s", totalFiles, totalFolders, h.formatFileSize(totalSize))
+	// 遍历 prediction，获得应下载内容，并进行文件大小统计
+	h.log.Infof("预测需要更新: %d 个文件，总大小: %s", prediction.FilesToUpdate, h.formatFileSize(prediction.UpdateSize))
+	fmt.Printf("预测需要更新: %d 个文件，总大小: %s\n", prediction.FilesToUpdate, h.formatFileSize(prediction.UpdateSize))
 
 	groupRoot := groupRootDir(status.GroupID)
 	if err := h.fsManager.MkdirAll(groupRoot); err != nil {
@@ -203,9 +201,11 @@ func (h *GroupFileHelper) DownloadAllFiles(status *GroupFileStatus) error {
 	skipCount := 0
 	errorCount := 0
 
-	for _, file := range status.Files {
+	for _, file := range prediction.UpdateFileMap {
 		relativePath := groupRelativeFilePath(&file)
 		targetPath := filepath.Join(groupRoot, relativePath)
+
+		curCount := fmt.Sprintf("%d/%d", successCount+skipCount+1, prediction.FilesToUpdate)
 
 		if h.isFileExistsAndSameWithTimestamp(status.GroupID, targetPath, &file) {
 			skipCount++
@@ -215,14 +215,15 @@ func (h *GroupFileHelper) DownloadAllFiles(status *GroupFileStatus) error {
 
 		if err := h.downloadSingleFile(status.GroupID, &file, groupRoot); err != nil {
 			errorCount++
-			h.log.Errorf("下载文件 %s/%s 失败: %v", file.FolderPath, file.FileName, err)
+			h.log.Errorf("文件下载失败: %s/%s, 大小 %s, 进度 %s, 失败信息: %v", file.FolderPath, file.FileName, h.formatFileSize(file.FileSize), curCount, err)
 		} else {
-			h.log.Infof("文件下载成功: %s/%s", file.FolderPath, file.FileName)
+			h.log.Infof("文件下载成功: %s/%s, 大小 %s, 进度 %s", file.FolderPath, file.FileName, h.formatFileSize(file.FileSize), curCount)
 			successCount++
 		}
 	}
 
 	h.log.Infof("下载完成: 成功 %d 个，跳过 %d 个，失败 %d 个", successCount, skipCount, errorCount)
+	fmt.Printf("下载完成: 成功 %d 个，跳过 %d 个，失败 %d 个\n", successCount, skipCount, errorCount)
 
 	deletedCount, err := h.cleanupExtraFiles(status, groupRoot)
 	if err != nil {
@@ -373,51 +374,31 @@ func (h *GroupFileHelper) downloadSingleFile(groupID string, file *adapters.Grou
 // isFileExistsAndSameWithTimestamp 使用时间戳记录检查文件是否存在且相同
 
 func (h *GroupFileHelper) isFileExistsAndSameWithTimestamp(groupID string, filePath string, file *adapters.GroupFileInfo) bool {
-	stat, err := h.fsManager.Stat(filePath)
-	if err != nil {
-		return false
-	}
-
-	if stat.Size() != file.FileSize {
-		return false
-	}
-
 	// 使用内存缓存而不是每次读取文件
 	record, exists := h.getTimestampFromCache(groupID, filePath)
-	if !exists {
-		return false
+	if exists {
+		return true
 	}
 
-	if record.FileSize != file.FileSize || record.ModifyTime != file.ModifyTime || record.FileID != file.FileID {
-		return false
+	if !(record.FileSize != file.FileSize || record.ModifyTime != file.ModifyTime || record.FileID != file.FileID) {
+		return true
 	}
 
-	return true
-}
+	// 缓存不存在情况下，才读取本地文件大小进行比较
+	// stat, err := h.fsManager.Stat(filePath)
+	// if err != nil {
+	// 	return false
+	// }
 
-// isFileExistsAndSame 保持原有方法用于向后兼容
-func (h *GroupFileHelper) isFileExistsAndSame(filePath string, file *adapters.GroupFileInfo) bool {
-	stat, err := h.fsManager.Stat(filePath)
-	if err != nil {
-		return false // 文件不存在
-	}
+	// if stat.Size() != file.FileSize {
+	// 	return false
+	// }
 
-	// 检查文件大小
-	if stat.Size() != file.FileSize {
-		return false
-	}
-
-	// 检查修改时间（允许1秒误差）
-	fileModTime := time.Unix(file.ModifyTime, 0)
-	if abs(stat.ModTime().Unix()-fileModTime.Unix()) > 1 {
-		return false
-	}
-
-	return true
+	// 改: 缓存不存在，直接认为文件不存在
+	return false
 }
 
 // downloadFileFromURL 从URL下载文件
-
 func (h *GroupFileHelper) downloadFileFromURLToFS(url, filePath string) error {
 	resp, err := http.Get(url)
 	if err != nil {
@@ -725,14 +706,14 @@ func (h *GroupFileHelper) cleanupTimestampFile(groupID string) error {
 }
 
 func (h *GroupFileHelper) SyncGroupFiles(groupID string) error {
-	// 获取完整文件列表
-	status, err := h.GetCompleteFileList(groupID)
+	prediction, err := h.GenerateSyncPrediction(groupID)
 	if err != nil {
-		return fmt.Errorf("获取文件列表失败: %w", err)
+		return fmt.Errorf("生成同步预测失败: %w", err)
 	}
+	h.PrintSyncPrediction(prediction)
 
 	// 下载所有文件
-	err = h.DownloadAllFiles(status)
+	err = h.DownloadAllFilesWithPrediction(prediction)
 	if err != nil {
 		return fmt.Errorf("下载文件失败: %w", err)
 	}
@@ -744,4 +725,143 @@ func (h *GroupFileHelper) SyncGroupFiles(groupID string) error {
 	}
 
 	return nil
+}
+
+// SyncPrediction 同步预测结果
+type SyncPrediction struct {
+	// 远程端
+	TotalFiles   int   `json:"total_files"`
+	TotalFolders int   `json:"total_folders"`
+	TotalSize    int64 `json:"total_size"`
+
+	// 本地已存在
+	ExistingFiles   int   `json:"existing_files"`
+	ExistingFolders int   `json:"existing_folders"`
+	ExistingSize    int64 `json:"existing_size"`
+
+	// 需要下载/创建
+	FilesToUpdate   int   `json:"files_to_update"`
+	FoldersToCreate int   `json:"folders_to_create"`
+	UpdateSize      int64 `json:"update_size"`
+
+	// 需要删除
+	FilesToDelete   int   `json:"files_to_delete"`
+	FoldersToDelete int   `json:"folders_to_delete"`
+	DeleteSize      int64 `json:"delete_size"`
+
+	UpdateFileMap   map[string]adapters.GroupFileInfo `json:"update_file_map"`
+	GroupFileStatus *GroupFileStatus                  `json:"group_file_status"`
+}
+
+func (h *GroupFileHelper) GenerateSyncPrediction(groupID string) (*SyncPrediction, error) {
+	h.log.Infof("开始生成群 %s 的同步预测信息", groupID)
+
+	status, err := h.GetCompleteFileList(groupID)
+	if err != nil {
+		return nil, fmt.Errorf("获取远程文件列表失败: %w", err)
+	}
+
+	// 预加载时间戳缓存
+	if err := h.preloadTimestampCache(groupID); err != nil {
+		h.log.Warnf("预加载时间戳缓存失败: %v", err)
+	}
+
+	h.log.Infof("预加载时间戳缓存完成: %s", groupID)
+
+	prediction := &SyncPrediction{
+		TotalFiles:      len(status.Files),
+		TotalFolders:    len(status.Folders),
+		GroupFileStatus: status,
+	}
+
+	for _, file := range status.Files {
+		prediction.TotalSize += file.FileSize
+	}
+
+	groupRoot := groupRootDir(groupID)
+
+	existingFileMap := make(map[string]bool)
+	filesToDeleteMap := make(map[string]int64)
+
+	existsFileList, err := h.fsManager.ListStatusFilesX(groupRoot)
+	if err != nil {
+		return nil, fmt.Errorf("列出本地文件系统失败: %w", err)
+	}
+	// QQ群其实也没有文件夹概念，所以不用在意
+	// existsFileList = append([]string{groupRoot}, existsFileList...)
+	for _, file := range existsFileList {
+		fullPath := filepath.ToSlash(file)
+		existingFileMap[fullPath] = true
+	}
+
+	updateFileMap := make(map[string]adapters.GroupFileInfo)
+	prediction.UpdateFileMap = updateFileMap
+
+	for _, file := range status.Files {
+		relPath := filepath.ToSlash(groupRelativeFilePath(&file))
+		fullPath := filepath.ToSlash(filepath.Join(groupRoot, relPath))
+
+		if existingFileMap[fullPath] {
+			if h.isFileExistsAndSameWithTimestamp(groupID, fullPath, &file) {
+				prediction.ExistingFiles++
+				prediction.ExistingSize += file.FileSize
+				delete(filesToDeleteMap, relPath)
+			} else {
+				prediction.FilesToUpdate++
+				prediction.UpdateSize += file.FileSize
+				delete(filesToDeleteMap, relPath)
+
+				updateFileMap[fullPath] = file
+			}
+		} else {
+			prediction.FilesToUpdate++
+			prediction.UpdateSize += file.FileSize
+
+			updateFileMap[fullPath] = file
+		}
+	}
+
+	remoteFolderMap := make(map[string]bool)
+	for _, folder := range status.Folders {
+		folderPath := filepath.ToSlash(sanitizeComponent(folder.FolderName))
+		remoteFolderMap[folderPath] = true
+
+		prediction.ExistingFolders++
+	}
+
+	for relPath, size := range filesToDeleteMap {
+		_ = relPath
+		prediction.FilesToDelete++
+		prediction.DeleteSize += size
+	}
+
+	h.log.Infof("同步预测已生成")
+	return prediction, nil
+}
+
+func (h *GroupFileHelper) PrintSyncPrediction(p *SyncPrediction) {
+	h.log.Info("========== 同步预测结果 ==========")
+	h.log.Infof("群内文件: %d 个文件夹 / %d 个文件 / 总大小 %s",
+		p.TotalFolders, p.TotalFiles, h.formatFileSize(p.TotalSize))
+	h.log.Infof("当前已存: %d 个文件夹 / %d 个文件 / 大小 %s",
+		p.ExistingFolders, p.ExistingFiles, h.formatFileSize(p.ExistingSize))
+	h.log.Infof("需要更新: %d 个文件 / 下载 %s",
+		p.FilesToUpdate, h.formatFileSize(p.UpdateSize))
+	h.log.Infof("需要创建: %d 个文件夹", p.FoldersToCreate)
+	h.log.Infof("需要删除: %d 个文件 / %d 个文件夹 / 释放 %s",
+		p.FilesToDelete, p.FoldersToDelete, h.formatFileSize(p.DeleteSize))
+	h.log.Infof("================================")
+
+	// 上面的在日志中，以下在命令行直接输出
+	fmt.Println("========== 同步预测结果 ==========")
+	fmt.Printf("群内文件: %d 个文件夹 / %d 个文件 / 总大小 %s\n",
+		p.TotalFolders, p.TotalFiles, h.formatFileSize(p.TotalSize))
+	fmt.Printf("当前已存: %d 个文件夹 / %d 个文件 / 大小 %s\n",
+		p.ExistingFolders, p.ExistingFiles, h.formatFileSize(p.ExistingSize))
+	fmt.Printf("需要更新: %d 个文件 / 下载 %s\n",
+		p.FilesToUpdate, h.formatFileSize(p.UpdateSize))
+	fmt.Printf("需要创建: %d 个文件夹\n", p.FoldersToCreate)
+	fmt.Printf("需要删除: %d 个文件 / %d 个文件夹 / 释放 %s\n",
+		p.FilesToDelete, p.FoldersToDelete, h.formatFileSize(p.DeleteSize))
+	fmt.Println("================================")
 }

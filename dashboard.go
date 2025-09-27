@@ -1607,7 +1607,11 @@ const dashboardPageTemplate = `<!DOCTYPE html>
       }
       if (file.previewKind === "text") {
         const html = "<div class=\"max-w-3xl text-left\"><pre class=\"max-h-[70vh] overflow-auto whitespace-pre-wrap break-words rounded-2xl bg-slate-900/70 p-4 text-xs leading-relaxed text-slate-100\">加载中...</pre></div>";
-        window.Fancybox.show([{ src: html, type: "html", caption: escapeHTML(caption) }]);
+        window.Fancybox.show([{ src: html, type: "html", caption: escapeHTML(caption) }], {
+          dragToClose: false,   // 1. 关掉拖动关闭
+          contentClick: false,  // 2. 点击内容不关闭
+          groupAll: false,      // 3. 禁止左右滑动切图
+        });
         fetch(file.downloadURL)
           .then((response) => {
             if (!response.ok) {

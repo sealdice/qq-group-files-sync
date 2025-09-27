@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sealdice/smallseal/adapters"
@@ -42,14 +43,26 @@ type GroupFileHelper struct {
 	adapter   adapters.PlatformAdapter
 	fsManager *FileSystemManager
 	log       *zap.SugaredLogger
+
+	// 内存缓存相关字段
+	timestampCache map[string]map[string]FileTimestampRecord // groupID -> filePath -> record
+	cacheMutex     sync.RWMutex
+
+	// 批量写入相关字段
+	pendingWrites map[string][]FileTimestampRecord // groupID -> pending records
+	writeCounter  map[string]int                   // groupID -> counter
+	writeMutex    sync.Mutex
 }
 
 // NewGroupFileHelper 创建群文件助手
 func NewGroupFileHelper(adapter adapters.PlatformAdapter, fsManager *FileSystemManager) *GroupFileHelper {
 	return &GroupFileHelper{
-		adapter:   adapter,
-		fsManager: fsManager,
-		log:       zap.S().Named("group_file_helper"),
+		adapter:        adapter,
+		fsManager:      fsManager,
+		log:            zap.S().Named("group_file_helper"),
+		timestampCache: make(map[string]map[string]FileTimestampRecord),
+		pendingWrites:  make(map[string][]FileTimestampRecord),
+		writeCounter:   make(map[string]int),
 	}
 }
 
@@ -160,6 +173,11 @@ func (h *GroupFileHelper) formatUploaderID(uploaderQQ int64) int64 {
 func (h *GroupFileHelper) DownloadAllFiles(status *GroupFileStatus) error {
 	h.log.Infof("开始下载群 %s 的所有文件到目录: %s", status.GroupID, h.fsManager.GetBasePath())
 
+	// 预加载时间戳缓存
+	if err := h.preloadTimestampCache(status.GroupID); err != nil {
+		h.log.Warnf("预加载时间戳缓存失败: %v", err)
+	}
+
 	totalFiles := len(status.Files)
 	totalFolders := len(status.Folders)
 	var totalSize int64
@@ -167,7 +185,7 @@ func (h *GroupFileHelper) DownloadAllFiles(status *GroupFileStatus) error {
 		totalSize += file.FileSize
 	}
 
-	h.log.Infof("预览信息: %d 个文件，%d 个文件夹，总大小: %s", totalFiles, totalFolders, h.formatFileSize(totalSize))
+	h.log.Infof("预计下载: %d 个文件，%d 个文件夹，总大小: %s", totalFiles, totalFolders, h.formatFileSize(totalSize))
 
 	groupRoot := groupRootDir(status.GroupID)
 	if err := h.fsManager.MkdirAll(groupRoot); err != nil {
@@ -191,13 +209,15 @@ func (h *GroupFileHelper) DownloadAllFiles(status *GroupFileStatus) error {
 
 		if h.isFileExistsAndSameWithTimestamp(status.GroupID, targetPath, &file) {
 			skipCount++
+			h.log.Infof("文件 %s/%s 已存在且与群文件相同，跳过下载", file.FolderPath, file.FileName)
 			continue
 		}
 
 		if err := h.downloadSingleFile(status.GroupID, &file, groupRoot); err != nil {
 			errorCount++
-			h.log.Errorf("下载文件 %s 失败: %v", file.FileName, err)
+			h.log.Errorf("下载文件 %s/%s 失败: %v", file.FolderPath, file.FileName, err)
 		} else {
+			h.log.Infof("文件下载成功: %s/%s", file.FolderPath, file.FileName)
 			successCount++
 		}
 	}
@@ -213,6 +233,11 @@ func (h *GroupFileHelper) DownloadAllFiles(status *GroupFileStatus) error {
 
 	if err := h.saveStatusFile(status); err != nil {
 		h.log.Warnf("保存状态文件失败: %v", err)
+	}
+
+	// 强制写入所有待写入的时间戳记录
+	if err := h.FlushAllPendingWrites(); err != nil {
+		h.log.Warnf("强制写入时间戳记录失败: %v", err)
 	}
 
 	return nil
@@ -341,7 +366,6 @@ func (h *GroupFileHelper) downloadSingleFile(groupID string, file *adapters.Grou
 		h.log.Warnf("保存时间戳记录失败: %v", err)
 	}
 
-	h.log.Infof("文件下载成功: %s", file.FileName)
 	return nil
 }
 
@@ -358,14 +382,8 @@ func (h *GroupFileHelper) isFileExistsAndSameWithTimestamp(groupID string, fileP
 		return false
 	}
 
-	timestamps, err := h.loadFileTimestamps(groupID)
-	if err != nil {
-		h.log.Warnf("读取时间戳记录失败: %v", err)
-		return false
-	}
-
-	key := filepath.ToSlash(filePath)
-	record, exists := timestamps[key]
+	// 使用内存缓存而不是每次读取文件
+	record, exists := h.getTimestampFromCache(groupID, filePath)
 	if !exists {
 		return false
 	}
@@ -550,18 +568,91 @@ func (h *GroupFileHelper) loadFileTimestamps(groupID string) (map[string]FileTim
 	return timestamps, nil
 }
 
-// saveFileTimestamp 保存单个文件时间戳记录
-
-func (h *GroupFileHelper) saveFileTimestamp(groupID string, record FileTimestampRecord) error {
-	timestampFile := h.getTimestampFilePath(groupID)
+// preloadTimestampCache 预加载指定群的时间戳缓存
+func (h *GroupFileHelper) preloadTimestampCache(groupID string) error {
+	h.cacheMutex.Lock()
+	defer h.cacheMutex.Unlock()
 
 	timestamps, err := h.loadFileTimestamps(groupID)
 	if err != nil {
-		return err
+		return fmt.Errorf("预加载时间戳缓存失败: %w", err)
 	}
+
+	h.timestampCache[groupID] = timestamps
+	h.log.Infof("已预加载群 %s 的时间戳缓存，共 %d 条记录", groupID, len(timestamps))
+	return nil
+}
+
+// getTimestampFromCache 从缓存中获取时间戳记录
+func (h *GroupFileHelper) getTimestampFromCache(groupID string, filePath string) (FileTimestampRecord, bool) {
+	h.cacheMutex.RLock()
+	defer h.cacheMutex.RUnlock()
+
+	groupCache, exists := h.timestampCache[groupID]
+	if !exists {
+		return FileTimestampRecord{}, false
+	}
+
+	key := filepath.ToSlash(filePath)
+	record, exists := groupCache[key]
+	return record, exists
+}
+
+// updateTimestampCache 更新缓存中的时间戳记录
+func (h *GroupFileHelper) updateTimestampCache(groupID string, record FileTimestampRecord) {
+	h.cacheMutex.Lock()
+	defer h.cacheMutex.Unlock()
+
+	if h.timestampCache[groupID] == nil {
+		h.timestampCache[groupID] = make(map[string]FileTimestampRecord)
+	}
+
 	key := filepath.ToSlash(record.FilePath)
 	record.FilePath = key
-	timestamps[key] = record
+	h.timestampCache[groupID][key] = record
+}
+
+// saveFileTimestamp 保存单个文件时间戳记录（批量写入，每10条写入一次）
+func (h *GroupFileHelper) saveFileTimestamp(groupID string, record FileTimestampRecord) error {
+	h.writeMutex.Lock()
+	defer h.writeMutex.Unlock()
+
+	// 更新内存缓存
+	h.updateTimestampCache(groupID, record)
+
+	// 添加到待写入队列
+	if h.pendingWrites[groupID] == nil {
+		h.pendingWrites[groupID] = make([]FileTimestampRecord, 0)
+		h.writeCounter[groupID] = 0
+	}
+
+	h.pendingWrites[groupID] = append(h.pendingWrites[groupID], record)
+	h.writeCounter[groupID]++
+
+	// 每10条记录写入一次
+	if h.writeCounter[groupID] >= 10 {
+		return h.flushPendingWrites(groupID)
+	}
+
+	return nil
+}
+
+// flushPendingWrites 强制写入所有待写入的记录
+func (h *GroupFileHelper) flushPendingWrites(groupID string) error {
+	if len(h.pendingWrites[groupID]) == 0 {
+		return nil
+	}
+
+	timestampFile := h.getTimestampFilePath(groupID)
+
+	// 从缓存中获取所有记录
+	h.cacheMutex.RLock()
+	timestamps := h.timestampCache[groupID]
+	h.cacheMutex.RUnlock()
+
+	if timestamps == nil {
+		timestamps = make(map[string]FileTimestampRecord)
+	}
 
 	var builder strings.Builder
 	for _, rec := range timestamps {
@@ -575,7 +666,27 @@ func (h *GroupFileHelper) saveFileTimestamp(groupID string, record FileTimestamp
 	}
 
 	if err := h.fsManager.WriteFile(timestampFile, []byte(builder.String())); err != nil {
-		return fmt.Errorf("写入时间戳记录失败: %w", err)
+		return fmt.Errorf("批量写入时间戳记录失败: %w", err)
+	}
+
+	// 清空待写入队列
+	h.pendingWrites[groupID] = h.pendingWrites[groupID][:0]
+	h.writeCounter[groupID] = 0
+
+	h.log.Debugf("已批量写入群 %s 的时间戳记录到文件", groupID)
+	return nil
+}
+
+// FlushAllPendingWrites 强制写入所有群的待写入记录（用于程序退出时）
+func (h *GroupFileHelper) FlushAllPendingWrites() error {
+	h.writeMutex.Lock()
+	defer h.writeMutex.Unlock()
+
+	for groupID := range h.pendingWrites {
+		if err := h.flushPendingWrites(groupID); err != nil {
+			h.log.Errorf("强制写入群 %s 的时间戳记录失败: %v", groupID, err)
+			return err
+		}
 	}
 
 	return nil

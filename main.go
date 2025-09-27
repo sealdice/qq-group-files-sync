@@ -41,7 +41,7 @@ func (cb *ob11Callback) OnMessageReceived(info *adapters.MessageSendCallbackInfo
 		fmt.Printf("OnMessageReceived: marshal err, info=%v, err=%v\n", info, err)
 		return
 	}
-	fmt.Printf("OnMessageReceived: %s, msg=%s\n", string(jsonInfo), info.Message.Segments.ToText())
+	fmt.Printf("OnMessageReceived: %s \n", string(jsonInfo))
 
 	if strings.Contains(info.Message.Segments.ToText(), "群名片") {
 		GroupCardNameSetRequest := &adapters.GroupOperationCardNameSetRequest{
@@ -133,6 +133,75 @@ func (cb *ob11Callback) OnMessageReceived(info *adapters.MessageSendCallbackInfo
 			TargetId: info.Message.GroupID,
 			Segments: []types.IMessageElement{
 				&types.TextElement{Content: fmt.Sprintf("群文件同步完成，已保存到: %s", basePath)},
+			},
+		})
+	}
+
+	// 检查是否是 ".同步文件 QQ-Group:xxx" 格式的消息
+	messageText := info.Message.Segments.ToText()
+	if strings.HasPrefix(messageText, ".同步文件 ") {
+		// 判断发送者不是自己，是自己就退出
+		// 如果 sender 是空的 就是自己
+		if info.Message.Sender.UserID == "" {
+			return
+		}
+
+		// 提取群组ID
+		parts := strings.Fields(messageText)
+		if len(parts) != 2 {
+			conn.MsgSendToGroup(&adapters.MessageSendRequest{
+				TargetId: info.Message.GroupID,
+				Segments: []types.IMessageElement{
+					&types.TextElement{Content: "格式错误，请使用: .同步文件 QQ-Group:群号"},
+				},
+			})
+			return
+		}
+
+		targetGroupID := parts[1]
+		// 验证群组ID格式
+		if !strings.HasPrefix(targetGroupID, "QQ-Group:") {
+			conn.MsgSendToGroup(&adapters.MessageSendRequest{
+				TargetId: info.Message.GroupID,
+				Segments: []types.IMessageElement{
+					&types.TextElement{Content: "群组ID格式错误，请使用: QQ-Group:群号"},
+				},
+			})
+			return
+		}
+
+		// 创建群文件助手，使用配置的文件系统管理器
+		helper := NewGroupFileHelper(conn, fsManager)
+
+		conn.MsgSendToGroup(&adapters.MessageSendRequest{
+			TargetId: info.Message.GroupID,
+			Segments: []types.IMessageElement{
+				&types.TextElement{Content: fmt.Sprintf("即将开始同步群 %s 的文件", targetGroupID)},
+			},
+		})
+
+		// 同步指定群的群文件
+		err := helper.SyncGroupFiles(targetGroupID)
+		if err != nil {
+			fmt.Printf("同步群文件失败: %v\n", err)
+			conn.MsgSendToGroup(&adapters.MessageSendRequest{
+				TargetId: info.Message.GroupID,
+				Segments: []types.IMessageElement{
+					&types.TextElement{Content: fmt.Sprintf("同步群 %s 文件失败: %v", targetGroupID, err)},
+				},
+			})
+			return
+		}
+		if err := GenerateDashboard(config, fsManager); err != nil {
+			zap.S().Warnf("failed to build dashboard: %v", err)
+		}
+
+		basePath := fsManager.GetBasePath()
+		fmt.Printf("群 %s 文件同步完成，保存到: %s\n", targetGroupID, basePath)
+		conn.MsgSendToGroup(&adapters.MessageSendRequest{
+			TargetId: info.Message.GroupID,
+			Segments: []types.IMessageElement{
+				&types.TextElement{Content: fmt.Sprintf("群 %s 文件同步完成，已保存到: %s", targetGroupID, basePath)},
 			},
 		})
 	}
@@ -256,7 +325,6 @@ func main() {
 		zap.S().Warnf("failed to build dashboard: %v", err)
 	}
 
-	fmt.Println("???")
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 

@@ -347,6 +347,11 @@ const dashboardPageTemplate = `<!DOCTYPE html>
       color: #475569;
       background-color: #f8fafc;
       padding: 12px;
+      text-align: left;
+    }
+    .uploader-column {
+      width: 10rem;
+      max-width: 10rem;
     }
     table tbody td {
       padding: 12px;
@@ -652,7 +657,7 @@ const dashboardPageTemplate = `<!DOCTYPE html>
             <thead>
               <tr>
                 <th class="pl-6">名称</th>
-                <th class="mobile-hide">上传者</th>
+                <th class="mobile-hide uploader-column">上传者</th>
                 <th>类型</th>
                 <th class="mobile-hide">大小</th>
                 <th class="mobile-hide">更新时间</th>
@@ -1200,7 +1205,7 @@ const dashboardPageTemplate = `<!DOCTYPE html>
           nameTd.appendChild(nameWrap);
 
           const uploaderTd = document.createElement("td");
-          uploaderTd.className = "px-4 py-3 text-slate-600 mobile-hide";
+          uploaderTd.className = "px-4 py-3 text-slate-600 mobile-hide uploader-column";
           uploaderTd.textContent = item.uploader || "-";
 
           const typeTd = document.createElement("td");
@@ -1349,7 +1354,7 @@ const dashboardPageTemplate = `<!DOCTYPE html>
         folderMetaTd.appendChild(folderMeta);
 
         const uploaderTd = document.createElement("td");
-        uploaderTd.className = "px-4 py-3 text-slate-400 mobile-hide";
+        uploaderTd.className = "px-4 py-3 text-slate-400 mobile-hide uploader-column";
         uploaderTd.textContent = "-";
 
         const typeTd = document.createElement("td");
@@ -1403,7 +1408,7 @@ const dashboardPageTemplate = `<!DOCTYPE html>
         nameTd.appendChild(nameWrap);
 
         const uploaderTd = document.createElement("td");
-        uploaderTd.className = "px-4 py-3 text-slate-600 mobile-hide";
+        uploaderTd.className = "px-4 py-3 text-slate-600 mobile-hide uploader-column";
         uploaderTd.textContent = file.uploader || "-";
 
         const typeTd = document.createElement("td");

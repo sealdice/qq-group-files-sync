@@ -122,7 +122,7 @@ func ReadConfig() *AppConfig {
 		config.Web.Title = "群文件导航"
 	}
 
-	k.Print()
+	// k.Print()
 	return &config
 }
 
